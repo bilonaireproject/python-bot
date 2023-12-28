@@ -1,7 +1,9 @@
 import typing as t
 from datetime import UTC, date, datetime
 
+import backoff
 import frontmatter
+from aiohttp import ClientResponse
 
 from bot.bot import Bot
 from bot.constants import Keys
@@ -71,6 +73,22 @@ class Event(t.NamedTuple):
         return f"<Event at '{self.path}'>"
 
 
+class GitHubServerError(Exception):
+    """
+    GitHub request has failed due to a server error.
+
+    Such requests shall be retried.
+    """
+
+
+retry_on_server_error = backoff.on_exception(
+    backoff.expo,
+    GitHubServerError,
+    max_tries=5,
+    jitter=None,
+)
+
+
 class BrandingRepository:
     """
     Branding repository abstraction.
@@ -93,6 +111,18 @@ class BrandingRepository:
     def __init__(self, bot: Bot) -> None:
         self.bot = bot
 
+    def _raise_for_status(self, response: ClientResponse) -> None:
+        """
+        Raise GitHubServerError if the response status is >= 500.
+
+        The server error indicates that the request shall be retried.
+        """
+        log.trace(f"Response status: {response.status}")
+        if response.status >= 500:
+            raise GitHubServerError
+        response.raise_for_status()
+
+    @retry_on_server_error
     async def fetch_directory(self, path: str, types: t.Container[str] = ("file", "dir")) -> dict[str, RemoteObject]:
         """
         Fetch directory found at `path` in the branding repository.
@@ -105,14 +135,12 @@ class BrandingRepository:
         log.debug(f"Fetching directory from branding repository: '{full_url}'.")
 
         async with self.bot.http_session.get(full_url, params=PARAMS, headers=HEADERS) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Failed to fetch directory due to status: {response.status}")
-
-            log.debug("Fetch successful, reading JSON response.")
+            self._raise_for_status(response)
             json_directory = await response.json()
 
         return {file["name"]: RemoteObject(file) for file in json_directory if file["type"] in types}
 
+    @retry_on_server_error
     async def fetch_file(self, download_url: str) -> bytes:
         """
         Fetch file as bytes from `download_url`.
@@ -122,10 +150,7 @@ class BrandingRepository:
         log.debug(f"Fetching file from branding repository: '{download_url}'.")
 
         async with self.bot.http_session.get(download_url, params=PARAMS, headers=HEADERS) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Failed to fetch file due to status: {response.status}")
-
-            log.debug("Fetch successful, reading payload.")
+            self._raise_for_status(response)
             return await response.read()
 
     def parse_meta_file(self, raw_file: bytes) -> MetaFile:
@@ -186,37 +211,30 @@ class BrandingRepository:
         """
         Discover available events in the branding repository.
 
-        Misconfigured events are skipped. May return an empty list in the catastrophic case.
+        Propagate errors if an event fails to fetch or deserialize. Such errors cannot be handled
+        and the operation should be retried in the future.
         """
         log.debug("Discovering events in branding repository.")
 
-        try:
-            event_directories = await self.fetch_directory("events", types=("dir",))  # Skip files.
-        except Exception:
-            log.exception("Failed to fetch 'events' directory.")
-            return []
+        event_directories = await self.fetch_directory("events", types=("dir",))  # Skip files.
 
         instances: list[Event] = []
 
         for event_directory in event_directories.values():
-            log.trace(f"Attempting to construct event from directory: '{event_directory.path}'.")
-            try:
-                instance = await self.construct_event(event_directory)
-            except Exception as exc:
-                log.warning(f"Could not construct event '{event_directory.path}'.", exc_info=exc)
-            else:
-                instances.append(instance)
+            log.trace(f"Reading event directory: '{event_directory.path}'.")
+            instance = await self.construct_event(event_directory)
+            instances.append(instance)
 
         return instances
 
-    async def get_current_event(self) -> tuple[Event | None, list[Event]]:
+    async def get_current_event(self) -> tuple[Event, list[Event]]:
         """
         Get the currently active event, or the fallback event.
 
         The second return value is a list of all available events. The caller may discard it, if not needed.
         Returning all events alongside the current one prevents having to query the API twice in some cases.
 
-        The current event may be None in the case that no event is active, and no fallback event is found.
+        If no event is active and the fallback event cannot be found, raise an error.
         """
         utc_now = datetime.now(tz=UTC)
         log.debug(f"Finding active event for: {utc_now}.")
@@ -239,5 +257,4 @@ class BrandingRepository:
             if event.meta.is_fallback:
                 return event, available_events
 
-        log.warning("No event is currently active and no fallback event was found!")
-        return None, available_events
+        raise RuntimeError("No event is currently active and no fallback event was found!")
